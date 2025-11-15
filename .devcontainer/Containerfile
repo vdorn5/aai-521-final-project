@@ -7,7 +7,7 @@ ENV PYTHONUNBUFFERED=1
 
 # Install Python and common dependencies
 RUN apt-get update && apt-get install -y \
-    git curl wget build-essential ffmpeg \
+    git git-lfs curl wget build-essential ffmpeg \
     vim nano htop unzip zip software-properties-common \
     && rm -rf /var/lib/apt/lists/*
 
