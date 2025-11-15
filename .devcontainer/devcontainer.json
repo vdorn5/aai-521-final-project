@@ -1,0 +1,25 @@
+{
+    "name": "Spine Score DevContainer",
+    "build": {
+        "dockerfile": "Containerfile",
+        "context": ".."
+    },
+    "runArgs": [
+        "--gpus", "all"
+    ],
+    "mounts": [
+        "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached"
+    ],
+    "workspaceFolder": "/workspace",
+    "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "ms-vscode.cpptools"
+    ],
+    "settings": {
+        "terminal.integrated.shell.linux": "/bin/bash",
+        "python.pythonPath": "/usr/bin/python3"
+    },
+    "forwardPorts": [8888],
+    "postCreateCommand": "echo 'Dev container ready!'"
+}
