@@ -75,7 +75,7 @@ The Dev Container automatically sets up:
 
 ## 3. Run Notebook
 
-The notebook (``)will walk through the steps to extract, transform, and load this data to use it with model training. It also will walk through an initial UNet modeling example.
+The notebook (`disk_segmentation_pipeline.ipynb`)will walk through the steps to extract, transform, and load this data to use it with model training. It also will walk through an initial UNet modeling example.
 
 ### Model Weights
 
