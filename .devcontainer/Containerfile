@@ -1,0 +1,29 @@
+# Base image with CUDA support
+FROM nvcr.io/nvidia/pytorch:22.12-py3
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+# Install Python and common dependencies
+RUN apt-get update && apt-get install -y \
+    git curl wget build-essential ffmpeg \
+    vim nano htop unzip zip software-properties-common \
+    && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip
+RUN python3 -m pip install --upgrade pip
+
+# Install AI/ML libraries
+RUN pip install --no-cache-dir \
+    numpy pandas scikit-learn matplotlib seaborn \
+    jupyter notebook notebook-as-pdf
+
+# Set working directory
+WORKDIR /workspace
+
+# Expose Jupyter port
+EXPOSE 8888
+
+# Start Jupyter Notebook by default
+CMD ["jupyter", "notebook", "--ip=0.0.0.0", "--allow-root", "--no-browser", "--NotebookApp.token=''", "--NotebookApp.password=''"]
