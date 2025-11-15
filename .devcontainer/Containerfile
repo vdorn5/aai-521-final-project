@@ -14,10 +14,15 @@ RUN apt-get update && apt-get install -y \
 # Upgrade pip
 RUN python3 -m pip install --upgrade pip
 
-# Install AI/ML libraries
+# Copy requirements.txt first (if it exists)
+COPY requirements.txt /tmp/requirements.txt
+
+# Install AI/ML libraries and any additional dependencies from requirements.txt
 RUN pip install --no-cache-dir \
     numpy pandas scikit-learn matplotlib seaborn \
-    jupyter notebook notebook-as-pdf
+    jupyter notebook notebook-as-pdf \
+    && if [ -f /tmp/requirements.txt ]; then pip install --no-cache-dir -r /tmp/requirements.txt; fi
+
 
 # Set working directory
 WORKDIR /workspace
