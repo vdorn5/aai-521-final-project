@@ -100,7 +100,8 @@ class SpineSegDataset(Dataset):
         return len(self.entries)
 
     def __getitem__(self, idx):
-        dicom_path, mask_path = self.entries[idx]
+        # Added patient_id (Edited)
+        patient_id, dicom_path, mask_path = self.entries[idx]
 
         # Load volume and mask
         volume = load_dicom_volume(dicom_path)  # (H,W,D)

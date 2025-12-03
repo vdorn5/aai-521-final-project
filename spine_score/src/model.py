@@ -1,8 +1,12 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import amp
 from tqdm import tqdm
 import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
 
 
 # ===========================
@@ -23,7 +27,6 @@ class DoubleConv(nn.Module):
 
     def forward(self, x):
         return self.double_conv(x)
-
 
 class SimpleUNet3D(nn.Module):
     def __init__(self, in_channels=1, out_channels=3, features=[32, 64, 128]):
@@ -85,31 +88,177 @@ class SimpleUNet3D(nn.Module):
         return self.final_conv(x)
 
 
+# ==========================================
+# V-Net Model Definition (Light Version)
+# ==========================================
+
+class VNetBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, num_layers=1, kernel_size=3, padding=1):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        for i in range(num_layers):
+            input_ch = in_channels if i == 0 else out_channels
+            self.layers.append(nn.Sequential(
+                nn.Conv3d(input_ch, out_channels, kernel_size=kernel_size, padding=padding),
+                nn.BatchNorm3d(out_channels),
+                nn.PReLU()
+            ))
+
+        if in_channels != out_channels:
+            self.project_residual = nn.Conv3d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.project_residual = None
+
+    def forward(self, x):
+        residual = x
+        out = x
+        for layer in self.layers:
+            out = layer(out)
+        if self.project_residual is not None:
+            residual = self.project_residual(residual)
+        return out + residual
+
+class VNetDeepSup(nn.Module):
+    def __init__(self, in_channels=1, out_channels=3, base_filters=16):
+        super().__init__()
+        
+        # --- Encoder ---
+        self.in_conv = nn.Conv3d(in_channels, base_filters, kernel_size=3, padding=1)
+        self.block1 = VNetBlock(base_filters, base_filters, num_layers=1)
+        self.down1 = nn.Conv3d(base_filters, base_filters*2, kernel_size=2, stride=2)
+        
+        self.block2 = VNetBlock(base_filters*2, base_filters*2, num_layers=2)
+        self.down2 = nn.Conv3d(base_filters*2, base_filters*4, kernel_size=2, stride=2)
+        
+        self.block3 = VNetBlock(base_filters*4, base_filters*4, num_layers=3)
+        self.down3 = nn.Conv3d(base_filters*4, base_filters*8, kernel_size=2, stride=2)
+        
+        # --- Bottleneck ---
+        self.block4 = VNetBlock(base_filters*8, base_filters*8, num_layers=3)
+        self.up4 = nn.ConvTranspose3d(base_filters*8, base_filters*4, kernel_size=2, stride=2)
+
+        # --- Decoder ---
+        self.block3_dec = VNetBlock(base_filters*8, base_filters*8, num_layers=3)
+        self.up3 = nn.ConvTranspose3d(base_filters*8, base_filters*2, kernel_size=2, stride=2)
+        
+        self.block2_dec = VNetBlock(base_filters*4, base_filters*4, num_layers=2)
+        self.up2 = nn.ConvTranspose3d(base_filters*4, base_filters, kernel_size=2, stride=2)
+        
+        self.block1_dec = VNetBlock(base_filters*2, base_filters*2, num_layers=1)
+        
+        # --- Output Heads ---
+        self.final_conv = nn.Conv3d(base_filters*2, out_channels, kernel_size=1)
+        
+        # Deep Supervision Heads
+        self.ds3_conv = nn.Conv3d(base_filters*8, out_channels, kernel_size=1)
+        self.ds2_conv = nn.Conv3d(base_filters*4, out_channels, kernel_size=1)
+        
+    def forward(self, x):
+        # Encoder
+        x1 = self.in_conv(x)
+        x1 = self.block1(x1)
+        x2 = self.down1(x1)
+        x2 = self.block2(x2)
+        x3 = self.down2(x2)
+        x3 = self.block3(x3)
+        
+        # Bottleneck
+        x4 = self.down3(x3)
+        x4 = self.block4(x4)
+        
+        # Decoder Level 3
+        up4 = self.up4(x4)
+        if up4.shape != x3.shape: up4 = self._pad_to_match(up4, x3)
+        cat4 = torch.cat([x3, up4], dim=1)
+        dec3 = self.block3_dec(cat4)
+        
+        # Decoder Level 2
+        up3 = self.up3(dec3)
+        if up3.shape != x2.shape: up3 = self._pad_to_match(up3, x2)
+        cat3 = torch.cat([x2, up3], dim=1)
+        dec2 = self.block2_dec(cat3)
+        
+        # Decoder Level 1
+        up2 = self.up2(dec2)
+        if up2.shape != x1.shape: up2 = self._pad_to_match(up2, x1)
+        cat2 = torch.cat([x1, up2], dim=1)
+        dec1 = self.block1_dec(cat2)
+        
+        final_out = self.final_conv(dec1)
+
+        # Return list if training, single tensor if validation
+        if self.training:
+            return [final_out, self.ds2_conv(dec2), self.ds3_conv(dec3)]
+        else:
+            return final_out
+
+    def _pad_to_match(self, src, target):
+        diffZ = target.shape[2] - src.shape[2]
+        diffY = target.shape[3] - src.shape[3]
+        diffX = target.shape[4] - src.shape[4]
+        return F.pad(src, [diffX // 2, diffX - diffX // 2,
+                           diffY // 2, diffY - diffY // 2,
+                           diffZ // 2, diffZ - diffZ // 2])
+
+
 # ===========================
 # Dice Loss + CrossEntropy
 # ===========================
-# class DiceCELoss(nn.Module):
-#     def __init__(self, weight=None):
-#         super().__init__()
-#         self.ce = nn.CrossEntropyLoss(weight=weight)
+class DiceCELoss(nn.Module):
+    def __init__(self, weight=None):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss(weight=weight)
 
-#     def forward(self, outputs, targets):
-#         # outputs: (B,C,H,W,D)
-#         # targets: (B,H,W,D)
-#         ce_loss = self.ce(outputs, targets)
+    def forward(self, outputs, targets):
+        # outputs: (B,C,H,W,D)
+        # targets: (B,H,W,D)
+        ce_loss = self.ce(outputs, targets)
 
-#         num_classes = outputs.shape[1]
-#         outputs_soft = torch.softmax(outputs, dim=1)
-#         targets_one_hot = F.one_hot(targets, num_classes).permute(0, 4, 1, 2, 3).float()
+        num_classes = outputs.shape[1]
+        outputs_soft = torch.softmax(outputs, dim=1)
+        targets_one_hot = F.one_hot(targets, num_classes).permute(0, 4, 1, 2, 3).float()
 
-#         smooth = 1e-5
-#         intersection = torch.sum(outputs_soft * targets_one_hot)
-#         union = torch.sum(outputs_soft + targets_one_hot)
-#         dice_loss = 1 - (2 * intersection + smooth) / (union + smooth)
+        smooth = 1e-5
+        intersection = torch.sum(outputs_soft * targets_one_hot)
+        union = torch.sum(outputs_soft + targets_one_hot)
+        dice_loss = 1 - (2 * intersection + smooth) / (union + smooth)
 
-#         return ce_loss + dice_loss
+        return ce_loss + dice_loss
+
+# ==========================================
+# Deep Supervision Loss
+# ==========================================
+class DeepSupDiceCELoss(nn.Module):
+    def __init__(self, weights=[1.0, 0.5, 0.25]):
+        super().__init__()
+        self.weights = weights
+        self.base_loss = DiceCELoss() 
+
+    def forward(self, outputs, targets):
+        if not isinstance(outputs, list):
+            return self.base_loss(outputs, targets)
+
+        total_loss = 0
+        target_shape = targets.shape[-3:]
+        
+        for i, pred in enumerate(outputs):
+            if pred.shape[-3:] != target_shape:
+                pred = F.interpolate(pred, size=target_shape, mode='trilinear', align_corners=False)
+            
+            layer_loss = self.base_loss(pred, targets)
+            w = self.weights[i] if i < len(self.weights) else 0.0
+            total_loss += w * layer_loss
+
+        return total_loss
+
+
 
 class GeneralizedDiceFocalLoss3D(nn.Module):
+    """
+    Combines:
+      - Focal Cross Entropy (class-balanced)
+      - Generalized Dice (volume-balanced)
+    """
     def __init__(self, ce_weights, dice_weight=0.0, gamma=1.0, eps=1e-6):
         super().__init__()
         self.register_buffer("ce_weights", ce_weights.float())
@@ -164,48 +313,48 @@ class GeneralizedDiceFocalLoss3D(nn.Module):
     def forward(self, logits, targets):
         ce = self.focal_ce(logits, targets)
         dice = self.generalized_dice(logits, targets)
-
         total = ce + self.dice_weight * dice
         return total, ce, dice
 
 # ===========================
 # Dice coefficient metric
 # ===========================
-# def dice_coeff(pred, target, num_classes=3, smooth=1e-5):
-#     """
-#     Compute per-class Dice coefficient
-#     pred: (B,H,W,D)
-#     target: (B,H,W,D)
-#     """
-#     dice = 0
-#     pred_one_hot = F.one_hot(pred, num_classes).permute(0, 4, 1, 2, 3)
-#     target_one_hot = F.one_hot(target, num_classes).permute(0, 4, 1, 2, 3)
-#     for c in range(num_classes):
-#         inter = torch.sum(pred_one_hot[:, c] * target_one_hot[:, c])
-#         union = torch.sum(pred_one_hot[:, c]) + torch.sum(target_one_hot[:, c])
-#         dice += (2 * inter + smooth) / (union + smooth)
-#     return dice / num_classes
-
 def dice_coeff(pred, target, num_classes=3, smooth=1e-5):
     """
-    Fast Dice computation using label masks (no one-hot).
-    pred:   (B,H,W,D)
+    Compute per-class Dice coefficient
+    pred: (B,H,W,D)
     target: (B,H,W,D)
     """
-    dice_scores = []
-
+    dice = 0
+    # One-hot encoding
+    pred_one_hot = F.one_hot(pred, num_classes).permute(0, 4, 1, 2, 3)
+    target_one_hot = F.one_hot(target, num_classes).permute(0, 4, 1, 2, 3)
+    
     for c in range(num_classes):
-        p = (pred == c).float()
-        t = (target == c).float()
+        inter = torch.sum(pred_one_hot[:, c] * target_one_hot[:, c])
+        union = torch.sum(pred_one_hot[:, c]) + torch.sum(target_one_hot[:, c])
+        dice += (2 * inter + smooth) / (union + smooth)
+    return dice / num_classes
 
-        inter = (p * t).sum()
-        denom = p.sum() + t.sum()
+# def dice_coeff(pred, target, num_classes=3, smooth=1e-5):
+#     """
+#     Fast Dice computation using label masks (no one-hot).
+#     pred:   (B,H,W,D)
+#     target: (B,H,W,D)
+#     """
+#     dice_scores = []
 
-        dice = (2 * inter + smooth) / (denom + smooth)
-        dice_scores.append(dice)
+#     for c in range(num_classes):
+#         p = (pred == c).float()
+#         t = (target == c).float()
 
-    return sum(dice_scores) / num_classes
+#         inter = (p * t).sum()
+#         denom = p.sum() + t.sum()
 
+#         dice = (2 * inter + smooth) / (denom + smooth)
+#         dice_scores.append(dice)
+
+#     return sum(dice_scores) / num_classes
 
 # ===========================
 # Training Loop
@@ -281,13 +430,16 @@ def dice_coeff(pred, target, num_classes=3, smooth=1e-5):
 
 #     return model, history
 
-import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
 
-def show_epoch_preview(images, masks, outputs, epoch, slice_mode="middle"):
+def show_epoch_preview(images, masks, outputs, epoch, save_dir=None, slice_mode="middle"):
     """
-    Visualizes one slice from the first item in the batch.
-    Shows: original slice, ground truth, prediction.
+    Displays a single validation slice inline during training.
+    Shows Original, Ground Truth, and Prediction.
+    Also saves validation slice during training.
+
+    images:  [B,1,D,H,W]
+    masks:   [B,D,H,W]
+    outputs: [B,C,D,H,W]
     """
     cmap = ListedColormap(["black", "yellow", "red"])
 
@@ -299,11 +451,10 @@ def show_epoch_preview(images, masks, outputs, epoch, slice_mode="middle"):
     probs = torch.softmax(outputs[0], dim=0)
     pred_mask = torch.argmax(probs, dim=0).cpu()
 
-    # Select a slice
+    # Slice Selection
     if slice_mode == "middle":
         mid = vol.shape[-1] // 2
     else:
-        # Slice containing most foreground
         fg_slices = torch.where(true_mask.sum(dim=(0,1)) > 0)[0]
         mid = int(fg_slices[len(fg_slices)//2]) if len(fg_slices) > 0 else vol.shape[-1]//2
 
@@ -331,17 +482,30 @@ def show_epoch_preview(images, masks, outputs, epoch, slice_mode="middle"):
     plt.imshow(pred_mask[:,:,mid], cmap=cmap, alpha=0.6, vmin=0, vmax=2)
     plt.axis("off")
 
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f"epoch_{epoch+1:03d}.png")
+        plt.savefig(save_path, dpi=120, bbox_inches="tight")
+
     plt.show()
 
 
-import torch
-from torch import amp
-import numpy as np
-from tqdm import tqdm
-
-def train_model(model, train_loader, val_loader, device,
+def train_model_UNet(model, train_loader, val_loader, device,
+                save_name="best_UNet.pth",
                 num_epochs=20, lr=5e-5, num_classes=3):
 
+    # ------------------------------
+    # Directory for training outputs
+    # ------------------------------
+    run_name = save_name.replace(".pth", "")
+    save_dir = os.path.join("../weights", run_name)
+    os.makedirs(save_dir, exist_ok=True)
+
+    best_model_path = os.path.join(save_dir, save_name)
+
+    # ------------------------------
+    # Setup model & optimizers
+    # ------------------------------
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -350,7 +514,7 @@ def train_model(model, train_loader, val_loader, device,
 
     # Stable class weights
     # You can plug your custom values here instead
-    ce_weights = torch.tensor([0.1, 1.0, 2.0], device=device).float()
+    ce_weights = torch.tensor([0.1, 1.0, 1.0], device=device).float()
 
     criterion = GeneralizedDiceFocalLoss3D(
         ce_weights=ce_weights,
@@ -369,9 +533,12 @@ def train_model(model, train_loader, val_loader, device,
     def dice_warmup(epoch):
         """Smooth warm-up 0 → 0.4 over 20 epochs"""
         return min(0.4, epoch / 20.0)
-
+    
+    # --------------------------------------
+    # Training Loop
+    # --------------------------------------
     for epoch in range(num_epochs):
-
+        # Hardcoded below
         criterion.dice_weight = 0.0 # dice_warmup(epoch)
 
         model.train()
@@ -397,15 +564,14 @@ def train_model(model, train_loader, val_loader, device,
             train_ce += ce_val.item()
             train_dice += dice_val.item()
 
-        # Store train metrics
         n = len(train_loader)
         history["train_loss"].append(train_loss / n)
         history["train_ce"].append(train_ce / n)
         history["train_dice"].append(train_dice / n)
 
-        # --------------------------
+        # ---------------------
         # Validation
-        # --------------------------
+        # ---------------------
         model.eval()
         val_loss = 0
         dice_scores = []
@@ -437,21 +603,19 @@ def train_model(model, train_loader, val_loader, device,
 
         per_class_avg = np.mean(per_class_list, axis=0).tolist()
 
-        # -----------------------------------------
-        # Inline preview visualization (first batch)
-        # -----------------------------------------
-        model.eval()
+        # --------------------------
+        # Save visualization image
+        # --------------------------
         with torch.no_grad():
             val_images, val_masks, _ = next(iter(val_loader))
             val_images = val_images.to(device)
             val_masks = val_masks.squeeze(1).to(device)
-
             val_outputs = model(val_images)
 
         # Show inline preview
-        show_epoch_preview(val_images, val_masks, val_outputs, epoch)
+        show_epoch_preview(val_images, val_masks, val_outputs, epoch, save_dir=save_dir)
 
-
+        # Store val metrics
         history["val_loss"].append(val_loss / len(val_loader))
         history["val_dice"].append(np.mean(dice_scores))
         history["val_per_class"].append(per_class_avg)
@@ -465,11 +629,100 @@ def train_model(model, train_loader, val_loader, device,
               f"ValDice={history['val_dice'][-1]:.4f} "
               f"(dice_w={criterion.dice_weight:.3f})")
 
-        # Save checkpoint
+        # ---------------------------------------
+        # Save best model (via calculated dice)
+        # ---------------------------------------
         if history["val_dice"][-1] > best_dice:
             best_dice = history["val_dice"][-1]
-            torch.save(model.state_dict(), "best_model.pth")
-            print(f"🔥 Saved new best model (Dice={best_dice:.4f})")
+            torch.save(model.state_dict(), best_model_path)
+            print(f"🔥 Saved new best model → {best_model_path}")
+
+    return model, history
+
+
+def train_vnet_deep_sup(model, train_loader, val_loader, device, 
+                        save_name="best_VNet.pth", 
+                        num_epochs=10, lr=1e-3, num_classes=3):
+
+    # ------------------------------
+    # Directory for training outputs
+    # ------------------------------
+    run_name = save_name.replace(".pth", "")
+    save_dir = os.path.join("../weights", run_name)
+    os.makedirs(save_dir, exist_ok=True)
+
+    best_model_path = os.path.join(save_dir, save_name)
+
+    model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = DeepSupDiceCELoss(weights=[1.0, 0.5, 0.25])
+    val_criterion = DiceCELoss() 
+    
+    best_dice = -1
+    history = {"train_loss": [], "val_loss": [], "val_dice": []}
+
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss = 0
+        
+        for images, masks, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False):
+            images = images.to(device)
+            masks = masks.to(device)
+
+            optimizer.zero_grad()
+            outputs_list = model(images) # Returns list of [High, Med, Low] res
+            loss = criterion(outputs_list, masks)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        history["train_loss"].append(train_loss / len(train_loader))
+
+        # Validation
+        model.eval()
+        val_loss = 0
+        all_dice = []
+        
+        with torch.no_grad():
+            for images, masks, _ in val_loader:
+                images = images.to(device)
+                masks = masks.to(device)
+                
+                output = model(images) # Returns single tensor in eval()
+                loss = val_criterion(output, masks)
+                val_loss += loss.item()
+
+                probs = torch.softmax(output, dim=1)
+                preds = torch.argmax(probs, dim=1)
+                
+                d = dice_coeff(preds, masks, num_classes=num_classes)
+                all_dice.append(d.item())
+        
+        # Inline Validation Preview
+        model.eval()
+        with torch.no_grad():
+            val_images, val_masks, _ = next(iter(val_loader))
+            val_images = val_images.to(device)
+            val_masks = val_masks.squeeze(1).to(device)
+            val_outputs = model(val_images)
+
+        show_epoch_preview(val_images, val_masks, val_outputs, epoch, save_dir=save_dir)
+
+        history["val_loss"].append(val_loss / len(val_loader))
+        history["val_dice"].append(np.mean(all_dice))
+
+        print(f"Epoch [{epoch+1}/{num_epochs}] "
+              f"Train Loss: {history['train_loss'][-1]:.4f} "
+              f"Val Loss: {history['val_loss'][-1]:.4f} "
+              f"Val Dice: {history['val_dice'][-1]:.4f}")
+        
+        # ---------------------------------------
+        # Save best model (via calculated dice)
+        # ---------------------------------------
+        if history["val_dice"][-1] > best_dice:
+            best_dice = history["val_dice"][-1]
+            torch.save(model.state_dict(), best_model_path)
+            print(f"🔥 Saved new best model → {best_model_path}")
 
     return model, history
 
@@ -524,32 +777,34 @@ def evaluate_model(model, dataloader, device, num_classes=3):
 
     with torch.no_grad():
         for images, masks, _ in dataloader:
-            images = images.to(device)           # (B, C, H, W, D)
-            masks  = masks.squeeze(1).to(device) # remove channel dim if needed: (B, H, W, D)
+            images = images.to(device)
+            masks  = masks.squeeze(1).to(device)
 
-            outputs = model(images)              # (B, num_classes, H, W, D)
-            # probs = torch.softmax(outputs, dim=1)
-            # preds = torch.argmax(probs, dim=1)  # (B, H, W, D)
+            outputs = model(images)
             preds = outputs.argmax(dim=1)
 
             batch_dice = []
             for cls in range(num_classes):
                 pred_cls = (preds == cls).float()
                 mask_cls = (masks == cls).float()
+
                 intersection = (pred_cls * mask_cls).sum()
                 union = pred_cls.sum() + mask_cls.sum()
                 dice = (2 * intersection + 1e-6) / (union + 1e-6)
+
                 batch_dice.append(dice.item())
+
             all_dice.append(batch_dice)
+
             metrics = compute_segmentation_metrics(preds, masks, num_classes=3)
             for key in all_metrics:
                 all_metrics[key].append(metrics[key])
     
-    # Average over batches
+    # Average metrics over batches
     for key in all_metrics:
         all_metrics[key] = torch.tensor(all_metrics[key], dtype=torch.float32).mean(dim=0)
 
-    all_dice = torch.tensor(all_dice)          # shape: (num_samples, num_classes)
+    all_dice = torch.tensor(all_dice)
     mean_dice = all_dice.mean().item()
     class_dice = all_dice.mean(dim=0).tolist() # Dice per class
 
